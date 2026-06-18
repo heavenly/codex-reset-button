@@ -159,11 +159,11 @@ final class ResetPopoverViewController: NSViewController {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 140))
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -180,7 +180,7 @@ final class ResetPopoverViewController: NSViewController {
         l.font = .systemFont(ofSize: size, weight: weight)
         l.lineBreakMode = .byWordWrapping
         l.maximumNumberOfLines = 0
-        l.preferredMaxLayoutWidth = 320
+        l.preferredMaxLayoutWidth = 256
         return l
     }
 
@@ -209,18 +209,14 @@ final class ResetPopoverViewController: NSViewController {
         guard isViewLoaded else { return }
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
-        let title = model.isLoading ? "Loading Codex resets…" : "\(model.availableCount) reset\(model.availableCount == 1 ? "" : "s") available"
-        stack.addArrangedSubview(label(title, size: 18, weight: .semibold))
+        let title = model.isLoading ? "Loading…" : "\(model.availableCount) reset\(model.availableCount == 1 ? "" : "s")"
+        stack.addArrangedSubview(label(title, size: 15, weight: .semibold))
 
         let row = NSStackView()
         row.orientation = .horizontal
-        row.spacing = 8
+        row.spacing = 6
         row.addArrangedSubview(button("Refresh", action: #selector(refreshTapped)))
-        let auto = button("Redeem auto", action: #selector(redeemAutoTapped))
-        auto.isEnabled = model.availableCount > 0 && !model.isLoading
-        row.addArrangedSubview(auto)
         row.addArrangedSubview(button("Quit", action: #selector(quitTapped)))
-        stack.addArrangedSubview(row)
 
         if let error = model.lastError {
             let err = label(error, size: 12, weight: .regular)
@@ -229,58 +225,76 @@ final class ResetPopoverViewController: NSViewController {
         }
 
         let available = model.credits.filter { $0.status == "available" }
+        preferredContentSize = NSSize(width: 280, height: min(max(96 + available.count * 46 + (model.lastError == nil ? 0 : 36), 120), 360))
+
         if available.isEmpty && !model.isLoading {
             stack.addArrangedSubview(label("No rate-limit resets are available.", size: 13))
         }
 
         for credit in available {
-            let box = NSBox()
-            box.boxType = .custom
-            box.cornerRadius = 8
-            box.borderColor = .separatorColor
-            box.borderWidth = 1
-            box.fillColor = .controlBackgroundColor
+            let item = NSStackView()
+            item.orientation = .horizontal
+            item.alignment = .centerY
+            item.spacing = 8
 
-            let inner = NSStackView()
-            inner.orientation = .vertical
-            inner.alignment = .leading
-            inner.spacing = 5
-            inner.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-            inner.translatesAutoresizingMaskIntoConstraints = false
-            box.addSubview(inner)
-            NSLayoutConstraint.activate([
-                inner.topAnchor.constraint(equalTo: box.topAnchor),
-                inner.leadingAnchor.constraint(equalTo: box.leadingAnchor),
-                inner.trailingAnchor.constraint(equalTo: box.trailingAnchor),
-                inner.bottomAnchor.constraint(equalTo: box.bottomAnchor),
-                box.widthAnchor.constraint(equalToConstant: 328)
-            ])
+            let text = NSStackView()
+            text.orientation = .vertical
+            text.alignment = .leading
+            text.spacing = 1
+            text.addArrangedSubview(label(credit.title ?? "Rate-limit reset", size: 13, weight: .medium))
+            let relative = label("Expires \(relativeExpiry(credit.expires_at))", size: 12)
+            relative.textColor = .secondaryLabelColor
+            text.addArrangedSubview(relative)
+            item.addArrangedSubview(text)
 
-            inner.addArrangedSubview(label(credit.title ?? "One rate-limit reset", size: 14, weight: .medium))
-            inner.addArrangedSubview(label("Expires: \(formatDate(credit.expires_at))", size: 12))
-            let id = label(credit.id, size: 10)
-            id.textColor = .secondaryLabelColor
-            inner.addArrangedSubview(id)
-            let redeem = button("Redeem this reset", action: #selector(redeemSpecificTapped(_:)))
+            let redeem = button("Reset", action: #selector(redeemSpecificTapped(_:)))
             redeem.identifier = NSUserInterfaceItemIdentifier(credit.id)
             redeem.isEnabled = !model.isLoading
-            inner.addArrangedSubview(redeem)
+            item.addArrangedSubview(redeem)
 
-            stack.addArrangedSubview(box)
+            text.widthAnchor.constraint(equalToConstant: 196).isActive = true
+            stack.addArrangedSubview(item)
         }
+
+        let spacer = NSView(frame: .zero)
+        spacer.heightAnchor.constraint(equalToConstant: 2).isActive = true
+        stack.addArrangedSubview(spacer)
+        stack.addArrangedSubview(row)
     }
 }
 
-func formatDate(_ s: String?) -> String {
-    guard let s else { return "-" }
+func parseISODate(_ s: String?) -> Date? {
+    guard let s else { return nil }
     let iso = ISO8601DateFormatter()
     iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = iso.date(from: s) ?? ISO8601DateFormatter().date(from: s)
-    guard let date else { return s }
-    let f = DateFormatter()
-    f.dateStyle = .medium
-    f.timeStyle = .short
-    return f.string(from: date)
+    return iso.date(from: s) ?? ISO8601DateFormatter().date(from: s)
+}
+
+func relativeExpiry(_ s: String?) -> String {
+    guard let date = parseISODate(s) else { return "at unknown time" }
+    let seconds = Int(date.timeIntervalSinceNow.rounded())
+    if seconds <= 0 { return "now" }
+    let minute = 60
+    let hour = 60 * minute
+    let day = 24 * hour
+    let month = 30 * day
+    let value: Int
+    let unit: String
+    switch seconds {
+    case month...:
+        value = max(1, seconds / month)
+        unit = value == 1 ? "month" : "months"
+    case day...:
+        value = max(1, seconds / day)
+        unit = value == 1 ? "day" : "days"
+    case hour...:
+        value = max(1, seconds / hour)
+        unit = value == 1 ? "hour" : "hours"
+    default:
+        value = max(1, seconds / minute)
+        unit = value == 1 ? "minute" : "minutes"
+    }
+    return "in \(value) \(unit)"
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -292,24 +306,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 360, height: 420)
+        popover.contentSize = NSSize(width: 280, height: 140)
         popover.contentViewController = ResetPopoverViewController(model: model)
 
         if let button = statusItem.button {
-            button.title = "Codex …"
+            button.title = "… resets"
             button.action = #selector(togglePopover(_:))
             button.target = self
         }
         model.onChange = { [weak self] in
             guard let self else { return }
-            self.statusItem.button?.title = self.model.isLoading ? "Codex …" : "Codex \(self.model.availableCount)"
+            self.statusItem.button?.title = self.model.isLoading ? "… resets" : "\(self.model.availableCount) reset\(self.model.availableCount == 1 ? "" : "s")"
             (self.popover.contentViewController as? ResetPopoverViewController)?.view.needsLayout = true
         }
         // Reassign after VC init overwrote onChange.
         if let vc = popover.contentViewController as? ResetPopoverViewController {
             model.onChange = { [weak self, weak vc] in
                 guard let self else { return }
-                self.statusItem.button?.title = self.model.isLoading ? "Codex …" : "Codex \(self.model.availableCount)"
+                self.statusItem.button?.title = self.model.isLoading ? "… resets" : "\(self.model.availableCount) reset\(self.model.availableCount == 1 ? "" : "s")"
                 vc?.render()
             }
         }
