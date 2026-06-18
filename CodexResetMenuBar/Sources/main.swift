@@ -1,0 +1,332 @@
+import AppKit
+import Foundation
+
+struct AuthFile: Decodable {
+    struct Tokens: Decodable { let access_token: String }
+    let tokens: Tokens
+}
+
+struct ResetCreditsResponse: Decodable {
+    let credits: [ResetCredit]
+    let available_count: Int
+}
+
+struct ResetCredit: Decodable {
+    let id: String
+    let status: String
+    let granted_at: String?
+    let expires_at: String?
+    let redeemed_at: String?
+    let title: String?
+    let description: String?
+}
+
+struct ConsumeResponse: Decodable {
+    let code: String?
+}
+
+enum APIError: LocalizedError {
+    case authMissing(String)
+    case invalidResponse(String)
+    case http(Int, String)
+
+    var errorDescription: String? {
+        switch self {
+        case .authMissing(let s): return s
+        case .invalidResponse(let s): return s
+        case .http(let code, let body): return "HTTP \(code): \(body)"
+        }
+    }
+}
+
+final class CodexAPI {
+    private let apiBase = (ProcessInfo.processInfo.environment["CODEX_API_BASE_URL"] ?? "https://chatgpt.com/backend-api").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    private let authPath: URL = {
+        if let override = ProcessInfo.processInfo.environment["CODEX_AUTH_JSON"], !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".codex/auth.json")
+    }()
+
+    func fetchCredits() async throws -> ResetCreditsResponse {
+        try await request("GET", path: "/wham/rate-limit-reset-credits", body: nil)
+    }
+
+    func redeem(creditId: String?) async throws -> ConsumeResponse {
+        var body: [String: String] = ["redeem_request_id": UUID().uuidString]
+        if let creditId, !creditId.isEmpty { body["credit_id"] = creditId }
+        return try await request("POST", path: "/wham/rate-limit-reset-credits/consume", body: body)
+    }
+
+    private func accessToken() throws -> String {
+        guard FileManager.default.fileExists(atPath: authPath.path) else {
+            throw APIError.authMissing("No auth file at \(authPath.path). Run Codex login first.")
+        }
+        let data = try Data(contentsOf: authPath)
+        let auth = try JSONDecoder().decode(AuthFile.self, from: data)
+        return auth.tokens.access_token
+    }
+
+    private func request<T: Decodable>(_ method: String, path: String, body: [String: String]?) async throws -> T {
+        guard let url = URL(string: apiBase + path) else { throw APIError.invalidResponse("Bad API URL") }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.timeoutInterval = 30
+        req.setValue("Bearer \(try accessToken())", forHTTPHeaderField: "Authorization")
+        req.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        req.setValue("Codex Desktop reset-menu-bar", forHTTPHeaderField: "User-Agent")
+        req.setValue("en", forHTTPHeaderField: "OAI-Language")
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONEncoder().encode(body)
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse("Non-HTTP response") }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+        }
+        if data.isEmpty, T.self == ConsumeResponse.self {
+            return ConsumeResponse(code: nil) as! T
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+}
+
+final class AppModel: ObservableObject {
+    let api = CodexAPI()
+    var credits: [ResetCredit] = []
+    var availableCount: Int = 0
+    var isLoading = false
+    var lastError: String?
+    var onChange: (() -> Void)?
+
+    func refresh() {
+        isLoading = true; lastError = nil; notify()
+        Task {
+            do {
+                let data = try await api.fetchCredits()
+                await MainActor.run {
+                    self.credits = data.credits
+                    self.availableCount = data.available_count
+                    self.isLoading = false
+                    self.notify()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isLoading = false
+                    self.lastError = error.localizedDescription
+                    self.notify()
+                }
+            }
+        }
+    }
+
+    func redeem(_ creditId: String?) {
+        isLoading = true; lastError = nil; notify()
+        Task {
+            do {
+                let result = try await api.redeem(creditId: creditId)
+                await MainActor.run {
+                    if let code = result.code, code != "reset" {
+                        self.lastError = "Redeem returned: \(code)"
+                    }
+                    self.isLoading = false
+                    self.refresh()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isLoading = false
+                    self.lastError = error.localizedDescription
+                    self.notify()
+                }
+            }
+        }
+    }
+
+    private func notify() { onChange?() }
+}
+
+final class ResetPopoverViewController: NSViewController {
+    private let model: AppModel
+    private let stack = NSStackView()
+
+    init(model: AppModel) {
+        self.model = model
+        super.init(nibName: nil, bundle: nil)
+        self.model.onChange = { [weak self] in self?.render() }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 420))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor)
+        ])
+        render()
+    }
+
+    private func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.font = .systemFont(ofSize: size, weight: weight)
+        l.lineBreakMode = .byWordWrapping
+        l.maximumNumberOfLines = 0
+        l.preferredMaxLayoutWidth = 320
+        return l
+    }
+
+    private func button(_ title: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        return b
+    }
+
+    @objc private func refreshTapped() { model.refresh() }
+    @objc private func quitTapped() { NSApp.terminate(nil) }
+    @objc private func redeemAutoTapped() { confirmRedeem(nil) }
+    @objc private func redeemSpecificTapped(_ sender: NSButton) { confirmRedeem(sender.identifier?.rawValue) }
+
+    private func confirmRedeem(_ creditId: String?) {
+        let alert = NSAlert()
+        alert.messageText = "Redeem a Codex rate-limit reset?"
+        alert.informativeText = creditId == nil ? "This will consume one available reset automatically." : "This will consume the selected reset."
+        alert.addButton(withTitle: "Redeem")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        if alert.runModal() == .alertFirstButtonReturn { model.redeem(creditId) }
+    }
+
+    func render() {
+        guard isViewLoaded else { return }
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+        let title = model.isLoading ? "Loading Codex resets…" : "\(model.availableCount) reset\(model.availableCount == 1 ? "" : "s") available"
+        stack.addArrangedSubview(label(title, size: 18, weight: .semibold))
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.addArrangedSubview(button("Refresh", action: #selector(refreshTapped)))
+        let auto = button("Redeem auto", action: #selector(redeemAutoTapped))
+        auto.isEnabled = model.availableCount > 0 && !model.isLoading
+        row.addArrangedSubview(auto)
+        row.addArrangedSubview(button("Quit", action: #selector(quitTapped)))
+        stack.addArrangedSubview(row)
+
+        if let error = model.lastError {
+            let err = label(error, size: 12, weight: .regular)
+            err.textColor = .systemRed
+            stack.addArrangedSubview(err)
+        }
+
+        let available = model.credits.filter { $0.status == "available" }
+        if available.isEmpty && !model.isLoading {
+            stack.addArrangedSubview(label("No rate-limit resets are available.", size: 13))
+        }
+
+        for credit in available {
+            let box = NSBox()
+            box.boxType = .custom
+            box.cornerRadius = 8
+            box.borderColor = .separatorColor
+            box.borderWidth = 1
+            box.fillColor = .controlBackgroundColor
+
+            let inner = NSStackView()
+            inner.orientation = .vertical
+            inner.alignment = .leading
+            inner.spacing = 5
+            inner.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+            inner.translatesAutoresizingMaskIntoConstraints = false
+            box.addSubview(inner)
+            NSLayoutConstraint.activate([
+                inner.topAnchor.constraint(equalTo: box.topAnchor),
+                inner.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+                inner.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+                inner.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+                box.widthAnchor.constraint(equalToConstant: 328)
+            ])
+
+            inner.addArrangedSubview(label(credit.title ?? "One rate-limit reset", size: 14, weight: .medium))
+            inner.addArrangedSubview(label("Expires: \(formatDate(credit.expires_at))", size: 12))
+            let id = label(credit.id, size: 10)
+            id.textColor = .secondaryLabelColor
+            inner.addArrangedSubview(id)
+            let redeem = button("Redeem this reset", action: #selector(redeemSpecificTapped(_:)))
+            redeem.identifier = NSUserInterfaceItemIdentifier(credit.id)
+            redeem.isEnabled = !model.isLoading
+            inner.addArrangedSubview(redeem)
+
+            stack.addArrangedSubview(box)
+        }
+    }
+}
+
+func formatDate(_ s: String?) -> String {
+    guard let s else { return "-" }
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = iso.date(from: s) ?? ISO8601DateFormatter().date(from: s)
+    guard let date else { return s }
+    let f = DateFormatter()
+    f.dateStyle = .medium
+    f.timeStyle = .short
+    return f.string(from: date)
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let popover = NSPopover()
+    private let model = AppModel()
+    private var timer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 360, height: 420)
+        popover.contentViewController = ResetPopoverViewController(model: model)
+
+        if let button = statusItem.button {
+            button.title = "Codex …"
+            button.action = #selector(togglePopover(_:))
+            button.target = self
+        }
+        model.onChange = { [weak self] in
+            guard let self else { return }
+            self.statusItem.button?.title = self.model.isLoading ? "Codex …" : "Codex \(self.model.availableCount)"
+            (self.popover.contentViewController as? ResetPopoverViewController)?.view.needsLayout = true
+        }
+        // Reassign after VC init overwrote onChange.
+        if let vc = popover.contentViewController as? ResetPopoverViewController {
+            model.onChange = { [weak self, weak vc] in
+                guard let self else { return }
+                self.statusItem.button?.title = self.model.isLoading ? "Codex …" : "Codex \(self.model.availableCount)"
+                vc?.render()
+            }
+        }
+        model.refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.model.refresh() }
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        if popover.isShown { popover.performClose(sender); return }
+        if let button = statusItem.button {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+        model.refresh()
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
