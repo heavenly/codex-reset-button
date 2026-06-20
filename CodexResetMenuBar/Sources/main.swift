@@ -297,15 +297,17 @@ func relativeExpiry(_ s: String?) -> String {
     return "in \(value) \(unit)"
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let model = AppModel()
     private var timer: Timer?
+    private var eventMonitors: [Any] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentSize = NSSize(width: 280, height: 140)
         popover.contentViewController = ResetPopoverViewController(model: model)
 
@@ -332,11 +334,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePopover(_ sender: Any?) {
-        if popover.isShown { popover.performClose(sender); return }
+        if popover.isShown { closePopover(sender); return }
         if let button = statusItem.button {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            installOutsideClickMonitors()
         }
         model.refresh()
+    }
+
+    private func closePopover(_ sender: Any?) {
+        popover.performClose(sender)
+        removeOutsideClickMonitors()
+    }
+
+    private func installOutsideClickMonitors() {
+        removeOutsideClickMonitors()
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self else { return event }
+            if self.shouldClosePopover(for: event) { self.closePopover(event) }
+            return event
+        }
+
+        let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            DispatchQueue.main.async { self?.closePopover(event) }
+        }
+
+        if let localMonitor { eventMonitors.append(localMonitor) }
+        if let globalMonitor { eventMonitors.append(globalMonitor) }
+    }
+
+    private func removeOutsideClickMonitors() {
+        eventMonitors.forEach { NSEvent.removeMonitor($0) }
+        eventMonitors.removeAll()
+    }
+
+    private func shouldClosePopover(for event: NSEvent) -> Bool {
+        guard popover.isShown else { return false }
+        let eventWindow = event.window
+        if eventWindow == popover.contentViewController?.view.window { return false }
+        if eventWindow == statusItem.button?.window { return false }
+        return true
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeOutsideClickMonitors()
     }
 }
 
