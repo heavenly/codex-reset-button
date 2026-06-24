@@ -225,8 +225,6 @@ final class ResetPopoverViewController: NSViewController {
         }
 
         let available = model.credits.filter { $0.status == "available" }
-        preferredContentSize = NSSize(width: 280, height: min(max(96 + available.count * 46 + (model.lastError == nil ? 0 : 36), 120), 360))
-
         if available.isEmpty && !model.isLoading {
             stack.addArrangedSubview(label("No rate-limit resets are available.", size: 13))
         }
@@ -256,10 +254,10 @@ final class ResetPopoverViewController: NSViewController {
             stack.addArrangedSubview(item)
         }
 
-        let spacer = NSView(frame: .zero)
-        spacer.heightAnchor.constraint(equalToConstant: 2).isActive = true
-        stack.addArrangedSubview(spacer)
         stack.addArrangedSubview(row)
+
+        view.layoutSubtreeIfNeeded()
+        preferredContentSize = NSSize(width: 280, height: min(max(ceil(stack.fittingSize.height), 96), 360))
     }
 }
 
